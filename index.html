@@ -284,7 +284,6 @@
 
     <script>
         let config = { dbUrl: '', apiKey: '' };
-        let files = [];
 
         function saveConfig() {
             config.dbUrl = document.getElementById('dbUrl').value.trim();
@@ -295,15 +294,52 @@
                 return;
             }
             
+            // Save config to localStorage for persistence
+            localStorage.setItem('fileshare_config', JSON.stringify(config));
             showStatus('Configuration saved successfully!', 'success');
             refreshFiles();
         }
 
-        function generateId() {
-            return Math.random().toString(36).substr(2, 9);
+        function loadConfig() {
+            const saved = localStorage.getItem('fileshare_config');
+            if (saved) {
+                config = JSON.parse(saved);
+                document.getElementById('dbUrl').value = config.dbUrl;
+                document.getElementById('apiKey').value = config.apiKey;
+            }
         }
 
-        function uploadFile() {
+        function generateId() {
+            return Date.now().toString(36) + Math.random().toString(36).substr(2, 5);
+        }
+
+        async function makeApiRequest(method, endpoint, data = null) {
+            const url = config.dbUrl.endsWith('/') ? config.dbUrl + endpoint : config.dbUrl + '/' + endpoint;
+            
+            const options = {
+                method: method,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${config.apiKey}`,
+                    'X-API-Key': config.apiKey,
+                    'apikey': config.apiKey
+                }
+            };
+            
+            if (data) {
+                options.body = JSON.stringify(data);
+            }
+            
+            const response = await fetch(url, options);
+            
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            
+            return await response.json();
+        }
+
+        async function uploadFile() {
             if (!config.dbUrl || !config.apiKey) {
                 showStatus('Please configure database settings first', 'error');
                 return;
@@ -319,9 +355,11 @@
 
             const file = fileInput.files[0];
             const fileId = generateId();
-            const reader = new FileReader();
             
-            reader.onload = function(e) {
+            showStatus('Uploading file...', 'success');
+            
+            const reader = new FileReader();
+            reader.onload = async function(e) {
                 const fileData = {
                     id: fileId,
                     name: file.name,
@@ -333,9 +371,26 @@
                     expiresAt: expiration > 0 ? new Date(Date.now() + expiration * 3600000).toISOString() : null
                 };
 
-                // Simulate API call
-                setTimeout(() => {
-                    files.push(fileData);
+                try {
+                    // Try different API patterns
+                    let success = false;
+                    const endpoints = ['files', 'documents', 'data', 'records'];
+                    
+                    for (const endpoint of endpoints) {
+                        try {
+                            await makeApiRequest('POST', endpoint, fileData);
+                            success = true;
+                            break;
+                        } catch (err) {
+                            continue;
+                        }
+                    }
+                    
+                    if (!success) {
+                        // Fallback: try direct URL
+                        await makeApiRequest('POST', '', fileData);
+                    }
+                    
                     showStatus(`File uploaded successfully! ID: ${fileId}`, 'success');
                     
                     const shareUrl = `${window.location.origin}${window.location.pathname}?file=${fileId}`;
@@ -344,48 +399,84 @@
                     
                     fileInput.value = '';
                     refreshFiles();
-                }, 1000);
+                    
+                } catch (error) {
+                    showStatus(`Upload failed: ${error.message}`, 'error');
+                }
             };
             
             reader.readAsDataURL(file);
-            showStatus('Uploading file...', 'success');
         }
 
-        function refreshFiles() {
-            const fileList = document.getElementById('fileList');
-            
-            if (files.length === 0) {
-                fileList.innerHTML = '<div style="padding: 20px; text-align: center; color: #666; font-size: 11px;">No files uploaded yet</div>';
+        async function refreshFiles() {
+            if (!config.dbUrl || !config.apiKey) {
+                document.getElementById('fileList').innerHTML = 
+                    '<div style="padding: 20px; text-align: center; color: #666; font-size: 11px;">Configure database to view files</div>';
                 return;
             }
 
-            // Filter expired files
-            const now = new Date();
-            files = files.filter(file => !file.expiresAt || new Date(file.expiresAt) > now);
-
-            fileList.innerHTML = files.map(file => {
-                const uploadDate = new Date(file.uploadTime).toLocaleString();
-                const expiresText = file.expiresAt ? 
-                    `Expires: ${new Date(file.expiresAt).toLocaleString()}` : 
-                    'Never expires';
+            try {
+                let files = [];
+                const endpoints = ['files', 'documents', 'data', 'records'];
                 
-                return `
-                    <div class="file-item">
-                        <div class="file-info">
-                            <div class="file-name">${file.name}</div>
-                            <div class="file-meta">Size: ${formatFileSize(file.size)} | Uploaded: ${uploadDate}</div>
-                            <div class="file-meta">${expiresText}</div>
+                for (const endpoint of endpoints) {
+                    try {
+                        const response = await makeApiRequest('GET', endpoint);
+                        files = Array.isArray(response) ? response : response.data || response.records || [];
+                        break;
+                    } catch (err) {
+                        continue;
+                    }
+                }
+                
+                if (files.length === 0) {
+                    try {
+                        const response = await makeApiRequest('GET', '');
+                        files = Array.isArray(response) ? response : response.data || [];
+                    } catch (err) {
+                        // Ignore
+                    }
+                }
+
+                const fileList = document.getElementById('fileList');
+                
+                if (files.length === 0) {
+                    fileList.innerHTML = '<div style="padding: 20px; text-align: center; color: #666; font-size: 11px;">No files found</div>';
+                    return;
+                }
+
+                // Filter expired files
+                const now = new Date();
+                const validFiles = files.filter(file => !file.expiresAt || new Date(file.expiresAt) > now);
+
+                fileList.innerHTML = validFiles.map(file => {
+                    const uploadDate = new Date(file.uploadTime).toLocaleString();
+                    const expiresText = file.expiresAt ? 
+                        `Expires: ${new Date(file.expiresAt).toLocaleString()}` : 
+                        'Never expires';
+                    
+                    return `
+                        <div class="file-item">
+                            <div class="file-info">
+                                <div class="file-name">${file.name}</div>
+                                <div class="file-meta">Size: ${formatFileSize(file.size)} | Uploaded: ${uploadDate}</div>
+                                <div class="file-meta">${expiresText}</div>
+                            </div>
+                            <div>
+                                <button class="btn" onclick="downloadById('${file.id}')">Download</button>
+                                <button class="btn" onclick="deleteFile('${file.id}')">Delete</button>
+                            </div>
                         </div>
-                        <div>
-                            <button class="btn" onclick="downloadById('${file.id}')">Download</button>
-                            <button class="btn" onclick="deleteFile('${file.id}')">Delete</button>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+                    `;
+                }).join('');
+                
+            } catch (error) {
+                document.getElementById('fileList').innerHTML = 
+                    `<div style="padding: 20px; text-align: center; color: #800000; font-size: 11px;">Error loading files: ${error.message}</div>`;
+            }
         }
 
-        function downloadFile() {
+        async function downloadFile() {
             const input = document.getElementById('downloadInput').value.trim();
             if (!input) {
                 showStatus('Please enter a file ID or share link', 'error');
@@ -397,40 +488,85 @@
                 fileId = input.split('?file=')[1];
             }
 
-            downloadById(fileId);
+            await downloadById(fileId);
         }
 
-        function downloadById(fileId) {
-            const file = files.find(f => f.id === fileId);
-            
-            if (!file) {
-                showStatus('File not found or expired', 'error');
+        async function downloadById(fileId) {
+            if (!config.dbUrl || !config.apiKey) {
+                showStatus('Please configure database settings first', 'error');
                 return;
             }
 
-            // Check if expired
-            if (file.expiresAt && new Date(file.expiresAt) <= new Date()) {
-                showStatus('File has expired', 'error');
-                return;
+            try {
+                let file = null;
+                const endpoints = [`files/${fileId}`, `documents/${fileId}`, `data/${fileId}`, `records/${fileId}`];
+                
+                for (const endpoint of endpoints) {
+                    try {
+                        const response = await makeApiRequest('GET', endpoint);
+                        file = response;
+                        break;
+                    } catch (err) {
+                        continue;
+                    }
+                }
+                
+                if (!file) {
+                    // Try getting all files and finding the one
+                    const allFiles = await refreshFiles();
+                    // This is handled in refreshFiles now
+                    showStatus('File not found or expired', 'error');
+                    return;
+                }
+
+                // Check if expired
+                if (file.expiresAt && new Date(file.expiresAt) <= new Date()) {
+                    showStatus('File has expired', 'error');
+                    return;
+                }
+
+                // Create download link
+                const link = document.createElement('a');
+                link.href = file.data;
+                link.download = file.name;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                showStatus(`Downloaded: ${file.name}`, 'success');
+                
+            } catch (error) {
+                showStatus(`Download failed: ${error.message}`, 'error');
             }
-
-            // Create download link
-            const link = document.createElement('a');
-            link.href = file.data;
-            link.download = file.name;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-
-            showStatus(`Downloaded: ${file.name}`, 'success');
         }
 
-        function deleteFile(fileId) {
+        async function deleteFile(fileId) {
             if (!confirm('Are you sure you want to delete this file?')) return;
             
-            files = files.filter(f => f.id !== fileId);
-            showStatus('File deleted successfully', 'success');
-            refreshFiles();
+            try {
+                const endpoints = [`files/${fileId}`, `documents/${fileId}`, `data/${fileId}`, `records/${fileId}`];
+                
+                let deleted = false;
+                for (const endpoint of endpoints) {
+                    try {
+                        await makeApiRequest('DELETE', endpoint);
+                        deleted = true;
+                        break;
+                    } catch (err) {
+                        continue;
+                    }
+                }
+                
+                if (deleted) {
+                    showStatus('File deleted successfully', 'success');
+                    refreshFiles();
+                } else {
+                    showStatus('Delete failed: File not found', 'error');
+                }
+                
+            } catch (error) {
+                showStatus(`Delete failed: ${error.message}`, 'error');
+            }
         }
 
         function copyLink() {
@@ -464,10 +600,17 @@
 
         // Check for file parameter in URL
         window.onload = function() {
+            loadConfig();
+            
             const urlParams = new URLSearchParams(window.location.search);
             const fileId = urlParams.get('file');
             if (fileId) {
                 document.getElementById('downloadInput').value = fileId;
+            }
+            
+            // Auto-refresh files if config is available
+            if (config.dbUrl && config.apiKey) {
+                refreshFiles();
             }
         };
     </script>
